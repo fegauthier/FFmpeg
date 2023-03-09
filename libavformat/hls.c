@@ -227,6 +227,7 @@ typedef struct HLSContext {
     int http_seekable;
     AVIOContext *playlist_pb;
     HLSCryptoContext  crypto_ctx;
+    char *initialServer;
 } HLSContext;
 
 static void free_segment_dynarray(struct segment **segments, int n_segments)
@@ -760,6 +761,20 @@ static int parse_playlist(HLSContext *c, const char *url,
         }
     }
 
+getManifest:
+
+    if(av_strnstr(url, "/live/play", strlen(url)) != NULL && c->initialServer == NULL) {
+        char *currentServer;
+        char *value;
+        currentServer = av_strdup(url);
+        currentServer = av_strireplace(currentServer, "http://", "");
+        currentServer = av_strireplace(currentServer, "https://", "");
+        currentServer = av_strtok(currentServer, "/", &value);
+        currentServer = av_strtok(currentServer, ":", &value);
+        c->initialServer = av_strdup(currentServer);
+        av_log(c, AV_LOG_WARNING, "Initial Server: %s\n", c->initialServer);
+    }
+
     if (!in) {
         AVDictionary *opts = NULL;
         av_dict_copy(&opts, c->avio_opts, 0);
@@ -769,8 +784,23 @@ static int parse_playlist(HLSContext *c, const char *url,
 
         ret = c->ctx->io_open(c->ctx, &in, url, AVIO_FLAG_READ, &opts);
         av_dict_free(&opts);
-        if (ret < 0)
-            return ret;
+        if (ret < 0) {
+            if(av_strnstr(url, "/live/play", strlen(url)) != NULL) {
+                av_log(c, AV_LOG_WARNING, "Error 509. Recalling original link\n");
+                url = c->ctx->url;
+                av_free(new_url);
+                ff_format_io_close(c->ctx, &in);
+                c->ctx->ctx_flags = c->ctx->ctx_flags & ~(unsigned)AVFMTCTX_UNSEEKABLE;
+                if (!c->n_variants || !c->variants[0]->n_playlists ||
+                    !(c->variants[0]->playlists[0]->finished ||
+                    c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT))
+                    c->ctx->ctx_flags |= AVFMTCTX_UNSEEKABLE;
+                goto getManifest;
+            }
+            else {
+                return ret;
+            }
+        }
 
         if (is_http && c->http_persistent)
             c->playlist_pb = in;
@@ -780,6 +810,28 @@ static int parse_playlist(HLSContext *c, const char *url,
 
     if (av_opt_get(in, "location", AV_OPT_SEARCH_CHILDREN, &new_url) >= 0)
         url = new_url;
+
+        if(av_strnstr(url, "/live/play", strlen(url)) != NULL) {
+        char *currentServer;
+        char *value;
+        currentServer = av_strdup(url);
+        currentServer = av_strireplace(currentServer, "http://", "");
+        currentServer = av_strireplace(currentServer, "https://", "");
+        currentServer = av_strtok(currentServer, "/", &value);
+        currentServer = av_strtok(currentServer, ":", &value);
+        if(c->initialServer != NULL && strcmp(currentServer, c->initialServer) != 0) {
+            av_log(c, AV_LOG_WARNING, "Not same server. We need to retry. Current Server: %s, Initial Server: %s\n", currentServer, c->initialServer);
+            url = c->ctx->url;
+            av_free(new_url);
+            ff_format_io_close(c->ctx, &in);
+            c->ctx->ctx_flags = c->ctx->ctx_flags & ~(unsigned)AVFMTCTX_UNSEEKABLE;
+            if (!c->n_variants || !c->variants[0]->n_playlists ||
+                !(c->variants[0]->playlists[0]->finished ||
+                c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT))
+                c->ctx->ctx_flags |= AVFMTCTX_UNSEEKABLE;
+            goto getManifest;
+        }
+    }
 
     ff_get_chomp_line(in, line, sizeof(line));
     if (strcmp(line, "#EXTM3U")) {
